@@ -1,35 +1,22 @@
+from datetime import datetime, timedelta, timezone
+
+import bcrypt
+from jose import JWTError, jwt
+
+from app.core.config import settings
 
 
-from pydantic_settings import BaseSettings, SettingsConfigDict
+def hash_password(plain_password: str) -> str:
+    # bcrypt's own hard limit is 72 bytes of input — reject anything longer
+    # with a clear error instead of silently truncating a user's password.
+    if len(plain_password.encode("utf-8")) > 72:
+        raise ValueError("Password must be 72 bytes or fewer")
+    hashed = bcrypt.hashpw(plain_password.encode("utf-8"), bcrypt.gensalt())
+    return hashed.decode("utf-8")
 
 
-class Settings(BaseSettings):
-    """
-    Central config. Every value here is overridden by an env var of the
-    same name (case-insensitive) — see .env.example.
-    """
-
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
-
-    # --- App ---
-    app_name: str = "Strata"
-    environment: str = "development"
-
-    # --- Database ---
-    # postgresql+asyncpg://user:password@host:port/dbname
-    database_url: str
-
-    # --- Auth ---
-    jwt_secret_key: str
-    jwt_algorithm: str = "HS256"
-    access_token_expire_minutes: int = 60
-
-    # --- Redis (used later for caching / worker queue) ---
-    redis_url: str = "redis://localhost:6379/0"
-
-
-# Import this singleton everywhere instead of re-instantiating Settings()
-settings = Settings()
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return bcrypt.checkpw(plain_password.encode("utf-8"), hashed_password.encode("utf-8"))
 
 def create_access_token(*, user_id: str, tenant_id: str, role: str) -> str:
     """
