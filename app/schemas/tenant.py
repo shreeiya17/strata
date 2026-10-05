@@ -37,6 +37,13 @@ class UserRead(BaseModel):
 
     model_config = {"from_attributes": True}
 
+# --- Admin-created users within an existing tenant (Day 6: RBAC) ---
+
+
+class UserCreateByAdmin(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=8, max_length=128)
+    role: UserRole = UserRole.VIEWER
 
 # --- Combined: registering a brand-new tenant + its first admin user together ---
 

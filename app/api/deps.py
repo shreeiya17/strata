@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import decode_access_token
 from app.db.session import get_db
-from app.models.tenant import User
+from app.models.tenant import User, UserRole
 
 bearer_scheme = HTTPBearer()
 
@@ -39,3 +39,22 @@ async def get_current_user(
     # tenant_id, re-derive isolation from the DB row itself, not just the
     # token's claim. The token is a cache of identity, not the source of truth.
     return user
+
+def require_role(*allowed_roles: UserRole):
+    """
+    Dependency FACTORY, not a dependency itself — call it with the roles
+    a route allows, e.g. Depends(require_role(UserRole.ADMIN)). Returns a
+    dependency that reuses get_current_user (so you get both identity AND
+    the role check from one Depends call) and 403s if the user's role
+    isn't in the allowed set.
+    """
+
+    async def _check_role(current_user: User = Depends(get_current_user)) -> User:
+        if current_user.role not in allowed_roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Requires one of: {', '.join(r.value for r in allowed_roles)}",
+            )
+        return current_user
+
+    return _check_role
