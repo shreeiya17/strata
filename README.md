@@ -4,8 +4,11 @@
 
 A production-grade backend exploring what it actually takes to serve multiple
 isolated tenants from one system: enforced data isolation at the schema
-level, per-tenant JWT auth with role-based access control, and (in progress)
-retrieval-augmented search with measured, not assumed, quality.
+level, per-tenant JWT auth with role-based access control, a background
+ingestion pipeline, and (in progress) retrieval with measured, not assumed,
+search quality.
+
+Developed and tested on macOS (Apple Silicon) with Python 3.13.
 
 ## Setup (zsh, macOS)
 
@@ -18,12 +21,14 @@ source .venv/bin/activate
 #    is a large install; the embedding model (~90MB) downloads on first use.
 pip install fastapi "uvicorn[standard]" "sqlalchemy>=2.0" asyncpg alembic \
   pydantic "pydantic[email]" pydantic-settings "python-jose[cryptography]" \
-  bcrypt python-multipart greenlet pgvector sentence-transformers
+  bcrypt python-multipart greenlet pgvector sentence-transformers arq
 
-# 3. Postgres 17 + pgvector — built and tested against a local Homebrew
-#    install. (Not 14: Homebrew's pgvector only supports 17 and 18.)
-brew install postgresql@17 pgvector
+# 3. Postgres 17 + pgvector, and Redis — built and tested against local
+#    Homebrew installs. (Not Postgres 14: Homebrew's pgvector only supports
+#    17 and 18.)
+brew install postgresql@17 pgvector redis
 brew services start postgresql@17
+brew services start redis
 echo 'export PATH="/opt/homebrew/opt/postgresql@17/bin:$PATH"' >> ~/.zshrc
 source ~/.zshrc          # postgresql@17 is keg-only, so it needs the PATH entry
 createdb strata
@@ -44,8 +49,11 @@ cp .env.example .env
 # 5. Apply the database migrations (this also enables the pgvector extension)
 alembic upgrade head
 
-# 6. Run the dev server
+# 6. Run the API
 uvicorn app.main:app --reload
+
+# 7. In a second terminal (venv active), run the background worker
+arq app.worker.WorkerSettings
 ```
 
 Confirm it's alive:
@@ -66,6 +74,10 @@ You should get back `{"status":"ok","environment":"development"}`.
 | `GET` | `/auth/me` | any role | Returns the current user, resolved from the JWT |
 | `POST` | `/users` | admin | Creates a user (with a role) inside the admin's own tenant |
 | `GET` | `/users` | any role | Lists users in the caller's tenant only |
+| `POST` | `/documents` | admin, editor | Uploads a `.txt`/`.md` file (≤1 MB) and queues indexing; returns 202 |
+| `GET` | `/documents` | any role | Lists the tenant's documents with status and chunk count |
+| `GET` | `/documents/{id}` | any role | Indexing status for one document |
+| `DELETE` | `/documents/{id}` | admin, editor | Deletes a document and its chunks |
 
 Full interactive docs (request/response schemas, try-it-out): `/docs`.
 
@@ -73,14 +85,16 @@ Full interactive docs (request/response schemas, try-it-out): `/docs`.
 
 | Done | Not yet |
 |---|---|
-| Async FastAPI app, Alembic migrations against real Postgres | Upload endpoint + background ingestion worker |
-| `Tenant` / `User` models, tenant isolation via `TenantScopedMixin` | Hybrid (keyword + vector) retrieval |
+| Async FastAPI app, Alembic migrations against real Postgres | Search endpoint (vector, then hybrid keyword + vector) |
+| `Tenant` / `User` models, tenant isolation via `TenantScopedMixin` | Answer generation with cited sources |
 | Tenant registration (atomic tenant + admin user creation) | Redis semantic caching |
 | JWT auth, login scoped per tenant | Evaluation harness (precision/recall on a labeled query set) |
 | RBAC (`require_role`) and tenant-scoped queries, verified across two tenants | Automated tests + CI |
 | `documents` / `document_chunks` schema with a `vector(384)` column (pgvector) | React frontend |
 | Paragraph-aware text chunker with overlap | |
 | Local embedding service (`all-MiniLM-L6-v2`, no API key or cost) | |
+| Upload API + `arq` background worker: chunk, embed, store | |
+| Incremental re-indexing: edits re-embed only changed chunks | |
 
 ## Design notes
 
@@ -103,6 +117,30 @@ tenant's chunk into the results; with it, nothing crossed over.
 API key. It truncates input beyond ~256 word-pieces, so chunks default to 800
 characters.
 
+**Ingestion is asynchronous.** Uploads are saved and queued, then return
+immediately (202); a separate `arq` worker chunks, embeds, and stores. The
+embedding model loads in the worker, never in the API process. A document's
+status moves `pending` → `processing` → `ready` or `failed` (with a reason).
+
+**Re-indexing is incremental.** The original text is stored, and on
+re-upload the worker embeds only chunks whose text it hasn't seen. Observed:
+a one-line edit to an 11-chunk document re-embedded 1 chunk and reused 10.
+Old chunks stay searchable until the new set is swapped in atomically.
+
+**Concurrent uploads are safe.** If a file is re-uploaded while an older job
+is still running, the older job notices its content hash is stale and
+discards its result instead of overwriting the newer version.
+
+**Failure handling.** If Redis is unavailable, uploads return 503 and the
+document is marked `failed`; the API itself and login keep working.
+Re-uploading a document that isn't `ready` (failed, or stuck because a
+worker died) queues it again. The `arq` worker exits if Redis restarts, so
+run it under a process supervisor in production.
+
+**Logging.** In `development`, SQL is echoed to the console, which includes
+document text and embedding vectors. Never run production with
+`ENVIRONMENT=development`.
+
 **Exact vector search for now.** No approximate index yet, so search has
 perfect recall. An index will be added later and its effect on recall and
 latency measured.
@@ -111,13 +149,14 @@ latency measured.
 
 ```
 app/
-  core/         — settings, password hashing, JWT encode/decode
+  core/         — settings, password hashing, JWT, Redis queue connection
   db/           — engine, session, declarative base + mixins
   models/       — SQLAlchemy models (Tenant, User, Document, DocumentChunk)
   schemas/      — Pydantic request/response models
-  services/     — chunking, embeddings
+  services/     — chunking, embeddings, ingestion
   api/
     deps.py     — shared dependencies (get_current_user, require_role)
-    routes/     — one router per resource (tenants, auth, users)
+    routes/     — one router per resource (tenants, auth, users, documents)
+  worker.py     — arq background worker
 migrations/     — Alembic migration scripts
 ```
