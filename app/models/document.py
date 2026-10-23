@@ -29,6 +29,11 @@ class Document(Base, TimestampMixin, TenantScopedMixin):
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    # The original text. Kept (not just the chunks) so the worker can read it,
+    # and so a document can be re-chunked with different settings later
+    # (e.g. for the chunk-size evaluation) without asking for a re-upload.
+    content: Mapped[str] = mapped_column(Text, nullable=False)
     # SHA-256 of the file contents. Lets re-uploads of an unchanged file be
     # skipped, and changed files be detected for incremental re-indexing.
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
